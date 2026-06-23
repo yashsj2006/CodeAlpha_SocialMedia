@@ -1,0 +1,13 @@
+{
+  "name": "connectsphere-frontend",
+  "version": "1.0.0",
+  "description": "Frontend static server for ConnectSphere",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
