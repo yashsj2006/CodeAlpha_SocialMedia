@@ -339,9 +339,9 @@ window.loadComments = async (postId) => {
         ${avatarEl({ fullName: c.authorFullName, profilePicture: c.authorProfilePicture }, 'sm')}
         <div class="comment-body">
           <div class="comment-author">${esc(c.authorUsername)}</div>
-          <div class="comment-text">${esc(c.comment)}</div>
+          <div class="comment-text">${esc(c.content)}</div>
           <div class="comment-time">${timeAgo(c.createdAt)}
-            ${c.authorId === state.user?.id ? `<button class="btn btn-ghost btn-sm" style="padding:0 .4rem;font-size:.72rem;" onclick="deleteComment(${c.id},${postId})">Delete</button>` : ''}
+            ${c.authorId === state.user?.id ? `<button class="btn btn-ghost btn-sm" style="padding:0 .4rem;font-size:.72rem;" onclick="deleteComment('${c.id}', '${postId}')">Delete</button>` : ''}
           </div>
         </div>
       </div>`).join('');
@@ -353,7 +353,7 @@ window.submitComment = async (postId) => {
   const text = input.value.trim();
   if (!text) return;
   try {
-    await comments.add(postId, { comment: text });
+    await comments.add(postId, { content: text });
     input.value = '';
     const countEl = document.getElementById(`comment-count-${postId}`);
     if (countEl) countEl.textContent = parseInt(countEl.textContent) + 1;
@@ -1302,8 +1302,8 @@ async function loadFollowRequests() {
           ${r.bio ? `<div class="user-result-bio">${esc(r.bio)}</div>` : ''}
         </div>
         <div style="display:flex;gap:.5rem;">
-          <button class="btn btn-primary btn-sm" onclick="acceptFollow(${r.requesterId})">Accept</button>
-          <button class="btn btn-ghost btn-sm" onclick="declineFollow(${r.requesterId})">Decline</button>
+          <button class="btn btn-primary btn-sm" onclick="acceptFollow('${r.requesterId}')">Accept</button>
+          <button class="btn btn-ghost btn-sm" onclick="declineFollow('${r.requesterId}')">Decline</button>
         </div>
       </div>`).join('');
   } catch(e) {
