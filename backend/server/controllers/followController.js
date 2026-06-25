@@ -92,13 +92,15 @@ exports.declineFollow = async (req, res) => {
 exports.getFollowRequests = async (req, res) => {
   try {
     const follows = await Follow.find({ following_id: req.user.id, status: 'pending' })
-      .populate('follower_id', 'full_name username profile_picture');
+      .populate('follower_id', 'full_name username profile_picture bio');
       
     res.json(follows.map(f => ({
       id: f.follower_id._id,
+      requesterId: f.follower_id._id,
       fullName: f.follower_id.full_name,
       username: f.follower_id.username,
-      profilePicture: f.follower_id.profile_picture
+      profilePicture: f.follower_id.profile_picture,
+      bio: f.follower_id.bio
     })));
   } catch (error) {
     res.status(500).json({ message: error.message });
