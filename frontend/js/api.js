@@ -29,7 +29,9 @@ export const auth = {
 export const users = {
   getProfile:    (id)   => request(`/profile/${id}`),
   updateProfile: (data) => request('/profile/update', { method: 'PUT', body: data }),
-  search:        (q)    => request(`/users/search?q=${encodeURIComponent(q)}`)
+  search:        (q)    => request(`/users/search?q=${encodeURIComponent(q)}`),
+  block:         (id)   => request(`/users/${id}/block`, { method: 'POST' }),
+  unblock:       (id)   => request(`/users/${id}/unblock`, { method: 'POST' })
 };
 
 export const posts = {

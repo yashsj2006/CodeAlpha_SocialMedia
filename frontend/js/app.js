@@ -1,5 +1,12 @@
 import { API_URL, auth, users, posts, comments, follow, notifications, messages } from './api.js';
 
+window.getImageUrl = (url) => {
+  if (!url) return '';
+  if (url.startsWith('http')) return url;
+  if (url.startsWith('/')) return `${API_URL}${url}`;
+  return `${API_URL}/${url}`;
+};
+
 // ── State ──────────────────────────────────────────────────────────
 const state = {
   user: JSON.parse(localStorage.getItem('user') || 'null'),
@@ -34,7 +41,7 @@ window.appNavigate = navigate;
 
 async function handleRoute() {
   const path = window.location.pathname;
-  clearPolling();
+  clearSocket();
   const token = localStorage.getItem('token');
   const publicPaths = ['/login', '/register'];
 
@@ -44,7 +51,7 @@ async function handleRoute() {
   const renderFn = routes[path] || render404;
   await renderFn();
 
-  if (token) startPolling();
+  if (token) initSocket();
 }
 
 // ── Toast ──────────────────────────────────────────────────────────
@@ -58,37 +65,57 @@ export function showToast(msg, type = '') {
 }
 window.showToast = showToast;
 
-// ── Polling ────────────────────────────────────────────────────────
-function startPolling() {
-  state.notifInterval = setInterval(pollNotifCount, 15000);
-  state.msgInterval   = setInterval(pollMsgCount,   10000);
-  pollNotifCount();
-  pollMsgCount();
-}
-function clearPolling() {
-  clearInterval(state.notifInterval);
-  clearInterval(state.msgInterval);
-}
-async function pollNotifCount() {
-  try {
-    const { count } = await notifications.getUnreadCount();
+// ── WebSockets ───────────────────────────────────────────────────────
+let socket = null;
+
+function initSocket() {
+  if (socket) return;
+  
+  // Create socket connection
+  socket = io('http://localhost:5000');
+  
+  socket.on('connect', () => {
+    if (state.user && state.user.id) {
+      socket.emit('join', state.user.id);
+    }
+  });
+
+  socket.on('receiveMessage', (msg) => {
+    const chatBox = document.querySelector('.chat-box');
+    const params = new URLSearchParams(window.location.search);
+    const activeUserId = params.get('userId');
+    
+    if (chatBox && window.location.pathname === '/messages' && activeUserId === msg.senderId) {
+      // We are in the active chat with the sender, append message
+      chatBox.innerHTML += `<div class="msg received">${esc(msg.content)}</div>`;
+      chatBox.scrollTop = chatBox.scrollHeight;
+    } else {
+      // We are not in the active chat, show dot and toast
+      const dot = document.getElementById('msg-dot');
+      if (dot) dot.style.display = 'block';
+      showToast('New message received!', 'info');
+    }
+  });
+
+  socket.on('newNotification', () => {
     const dot = document.getElementById('notif-dot');
-    if (dot) dot.style.display = count > 0 ? 'block' : 'none';
-  } catch(_) {}
+    if (dot) dot.style.display = 'block';
+    showToast('New notification!', 'info');
+  });
 }
-async function pollMsgCount() {
-  try {
-    const { count } = await messages.getUnreadCount();
-    const dot = document.getElementById('msg-dot');
-    if (dot) dot.style.display = count > 0 ? 'block' : 'none';
-  } catch(_) {}
+
+function clearSocket() {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
 }
 
 // ── Navbar ─────────────────────────────────────────────────────────
 function navbar() {
   const u = state.user;
   const avatarHtml = u?.profilePicture
-    ? `<img src="${API_URL}${u.profilePicture}" class="nav-avatar" alt="avatar">`
+    ? `<img src="${getImageUrl(u.profilePicture)}" class="nav-avatar" alt="avatar">`
     : `<div class="avatar avatar-sm" style="width:34px;height:34px;">${(u?.fullName||'U').charAt(0)}</div>`;
 
   return `
@@ -120,7 +147,7 @@ function navbar() {
 }
 
 function doLogout() {
-  clearPolling();
+  clearSocket();
   const currentToken = localStorage.getItem('token');
   const currentUserStr = localStorage.getItem('user');
   
@@ -178,7 +205,7 @@ function esc(str) {
 function avatarEl(u, size = 'md') {
   const letter = (u.fullName || u.authorFullName || 'U').charAt(0).toUpperCase();
   const src = u.profilePicture || u.authorProfilePicture;
-  if (src) return `<img src="${API_URL}${src}" class="avatar avatar-${size}" alt="${esc(letter)}">`;
+  if (src) return `<img src="${getImageUrl(src)}" class="avatar avatar-${size}" alt="${esc(letter)}">`;
   return `<div class="avatar avatar-${size}">${esc(letter)}</div>`;
 }
 
@@ -216,23 +243,23 @@ function postCardHtml(post, currentUserId) {
           <div class="post-author-handle">@${esc(post.authorUsername)} · <span class="post-time">${timeAgo(post.createdAt)}</span></div>
         </div>
       </div>
-      ${isOwn ? `<button class="btn btn-ghost btn-sm" onclick="deletePost(${post.id})"><i class="ph ph-trash"></i></button>` : ''}
+      ${isOwn ? `<button class="btn btn-ghost btn-sm" onclick="deletePost('${post.id}')" title="Delete Post" style="color:var(--error);"><i class="ph ph-trash"></i></button>` : ''}
     </div>
     <p class="post-content">${linkHashtags(post.content)}</p>
-    ${post.imageUrl ? `<img src="${API_URL}${post.imageUrl}" class="post-image" alt="post image" loading="lazy">` : ''}
+    ${post.imageUrl ? (post.imageUrl.match(/\.(mp4|webm|mov|avi)$/i) ? `<video src="${getImageUrl(post.imageUrl)}" class="post-image" controls></video>` : `<img src="${getImageUrl(post.imageUrl)}" class="post-image" alt="post image" loading="lazy">`) : ''}
     <div class="post-actions">
-      <button class="action-btn ${post.isLiked ? 'liked' : ''}" id="like-btn-${post.id}" onclick="toggleLike(${post.id})">
+      <button class="action-btn ${post.isLiked ? 'liked' : ''}" id="like-btn-${post.id}" onclick="toggleLike('${post.id}')">
         <i class="ph ${post.isLiked ? 'ph-heart-fill' : 'ph-heart'}"></i>
         <span id="like-count-${post.id}">${post.likesCount || 0}</span>
       </button>
-      <button class="action-btn" onclick="toggleComments(${post.id})">
+      <button class="action-btn" onclick="toggleComments('${post.id}')">
         <i class="ph ph-chat-circle"></i>
         <span id="comment-count-${post.id}">${post.commentsCount || 0}</span>
       </button>
-      <button class="action-btn ${post.isSaved ? 'saved' : ''}" id="save-btn-${post.id}" onclick="toggleSave(${post.id})">
+      <button class="action-btn ${post.isSaved ? 'saved' : ''}" id="save-btn-${post.id}" onclick="toggleSave('${post.id}')">
         <i class="ph ${post.isSaved ? 'ph-bookmark-fill' : 'ph-bookmark'}"></i>
       </button>
-      <button class="action-btn" onclick="doRepost(${post.id})">
+      <button class="action-btn" onclick="doRepost('${post.id}')">
         <i class="ph ph-repeat"></i>
         <span>${post.sharesCount || 0}</span>
       </button>
@@ -242,7 +269,7 @@ function postCardHtml(post, currentUserId) {
       <div class="comment-form">
         ${avatarEl(state.user || { fullName: 'U' }, 'sm')}
         <input class="form-control" placeholder="Add a comment…" id="comment-input-${post.id}">
-        <button class="btn btn-primary btn-sm" onclick="submitComment(${post.id})">Post</button>
+        <button class="btn btn-primary btn-sm" onclick="submitComment('${post.id}')">Post</button>
       </div>
     </div>
   </div>`;
@@ -350,13 +377,13 @@ async function renderLogin() {
   
   if (savedAccounts.length > 0) {
     const accountsHtml = savedAccounts.map(acc => `
-      <div class="card saved-account-card" style="display:flex;align-items:center;padding:.75rem;margin-bottom:.5rem;cursor:pointer;gap:1rem;border:1px solid var(--border);" onclick="loginSaved('${acc.token}', ${esc(JSON.stringify(acc).replace(/"/g, '&quot;'))})">
+      <div class="card saved-account-card" style="display:flex;align-items:center;padding:.75rem;margin-bottom:.5rem;cursor:pointer;gap:1rem;border:1px solid var(--border);" onclick="loginSaved('${acc.token}', '${acc.id}')">
         ${avatarEl({fullName:acc.fullName, profilePicture:acc.profilePicture}, 'md')}
         <div style="flex:1;">
           <div style="font-weight:600;">${esc(acc.fullName)}</div>
           <div class="text-muted" style="font-size:.8rem;">@${esc(acc.username)}</div>
         </div>
-        <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); removeSavedAccount(${acc.id})" style="padding:0;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;"><i class="ph ph-x"></i></button>
+        <button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); removeSavedAccount('${acc.id}')" style="padding:0;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;"><i class="ph ph-x"></i></button>
       </div>
     `).join('');
 
@@ -412,10 +439,16 @@ window.showLoginForm = () => {
   });
 };
 
-window.loginSaved = (token, userObj) => {
+window.loginSaved = (token, id) => {
+  const savedStr = localStorage.getItem('savedAccounts');
+  const saved = savedStr ? JSON.parse(savedStr) : [];
+  const userObj = saved.find(acc => acc.id === id);
+  if (!userObj) return;
+
   localStorage.setItem('token', token);
   localStorage.setItem('user', JSON.stringify(userObj));
   state.user = userObj;
+  initSocket();
   navigate('/');
 };
 
@@ -472,10 +505,8 @@ async function renderRegister() {
         email: document.getElementById('email').value,
         password: document.getElementById('password').value
       });
-      localStorage.setItem('token', res.token);
-      localStorage.setItem('user', JSON.stringify(res));
-      state.user = res;
-      navigate('/');
+      showToast('Account created successfully! Please log in.', 'success');
+      navigate('/login');
     } catch(e) { showToast(e.message, 'error'); btn.disabled = false; btn.textContent = 'Create Account'; }
   });
 }
@@ -516,7 +547,7 @@ async function renderHome() {
           <div class="create-post-actions">
             <div class="create-post-tools">
               <label class="post-tool-btn" for="post-image-input" title="Add image"><i class="ph ph-image"></i></label>
-              <input type="file" id="post-image-input" accept="image/*" style="display:none;">
+              <input type="file" id="post-image-input" accept="image/*,video/*" style="display:none;">
               <label class="post-tool-btn" for="story-toggle" title="Post as story" style="display:flex;align-items:center;gap:.25rem;font-size:.78rem;">
                 <input type="checkbox" id="story-toggle" style="accent-color:var(--primary);"> Story
               </label>
@@ -526,17 +557,11 @@ async function renderHome() {
         </div>
         <div id="feed">${spinner()}</div>
       </main>
-      <aside id="right-sidebar">
-        <div class="card sidebar-widget">
-          <div class="widget-title">Trending</div>
-          <div id="trending-list">${spinner()}</div>
-        </div>
-      </aside>
     </div>
   </div>`;
 
   setupNavSearch();
-  await Promise.all([loadStories(), loadFeed(), loadTrending()]);
+  await Promise.all([loadStories(), loadFeed()]);
   setupImagePreview();
 }
 
@@ -585,11 +610,11 @@ window.openStory = async (story) => {
       <div id="story-tab-likers" style="display:none;"></div>
     </div>
     <div style="position:absolute;bottom:20px;left:0;right:0;display:flex;justify-content:center;align-items:center;gap:1rem;z-index:10;">
-      <button class="btn btn-primary btn-sm" onclick="document.getElementById('story-stats-container').style.transform='translateY(0)'">View Stats</button>
-      ${!isOwn ? `
-      <button class="btn btn-ghost" onclick="toggleStoryLike(${story.id}, this)" style="background:rgba(0,0,0,0.5);color:white;border-radius:50%;width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;padding:0;">
-        <i class="ph ph-heart" style="font-size:1.2rem;"></i>
-      </button>` : ''}
+      ${isOwn ? `<button class="btn btn-primary btn-sm" onclick="document.getElementById('story-stats-container').style.transform='translateY(0)'">View Stats</button>
+                 <button class="btn btn-primary btn-sm" style="background:var(--error);border:none;padding-left:1.5rem;padding-right:1.5rem;" onclick="deleteStory('${story.id}')" title="Delete Story"><i class="ph ph-trash"></i> Delete</button>` 
+              : `<button class="btn btn-ghost" onclick="toggleStoryLike('${story.id}', this)" style="background:rgba(0,0,0,0.5);color:${story.isLiked ? 'var(--danger, #e0245e)' : 'white'};border-radius:50%;width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;padding:0;">
+                   <i class="ph ${story.isLiked ? 'ph-heart-fill' : 'ph-heart'}" style="font-size:1.2rem;"></i>
+                 </button>`}
     </div>
   `;
 
@@ -604,7 +629,7 @@ window.openStory = async (story) => {
           <div style="font-size:.72rem;color:var(--muted);">${timeAgo(story.createdAt)}</div>
         </div>
       </div>
-      ${story.imageUrl ? `<img src="${API_URL}${story.imageUrl}" class="story-img" alt="story">` : ''}
+      ${story.imageUrl ? (story.imageUrl.match(/\.(mp4|webm|mov|avi)$/i) ? `<video src="${getImageUrl(story.imageUrl)}" class="story-img" controls autoplay muted></video>` : `<img src="${getImageUrl(story.imageUrl)}" class="story-img" alt="story">`) : ''}
       <div class="story-text">${esc(story.content)}</div>
       ${actionsHtml}
     </div>`;
@@ -648,6 +673,19 @@ window.openStory = async (story) => {
   // Disable progress bar animation since we want users to be able to browse stats
   const progFill = overlay.querySelector('#story-prog-fill');
   if (progFill) progFill.style.animation = 'none';
+};
+
+window.deleteStory = async (id) => {
+  if (!confirm('Are you sure you want to delete this story?')) return;
+  try {
+    await posts.delete(id);
+    const modal = document.querySelector('.modal-overlay');
+    if (modal) modal.remove();
+    loadStories();
+    showToast('Story deleted', 'success');
+  } catch(e) {
+    showToast(e.message, 'error');
+  }
 };
 
 window.toggleStoryLike = async (storyId, btn) => {
@@ -701,9 +739,14 @@ function setupImagePreview() {
   if (!input) return;
   input.addEventListener('change', () => {
     if (!input.files[0]) return;
-    const url = URL.createObjectURL(input.files[0]);
+    const file = input.files[0];
+    const url = URL.createObjectURL(file);
     preview.style.display = 'block';
-    preview.innerHTML = `<img src="${url}" alt="preview"><button class="remove-image-btn" onclick="removeImage()"><i class="ph ph-x"></i></button>`;
+    if (file.type.startsWith('video/')) {
+      preview.innerHTML = `<video src="${url}" controls style="width:100%;border-radius:var(--radius-md);"></video><button class="remove-image-btn" onclick="removeImage()"><i class="ph ph-x"></i></button>`;
+    } else {
+      preview.innerHTML = `<img src="${url}" alt="preview"><button class="remove-image-btn" onclick="removeImage()"><i class="ph ph-x"></i></button>`;
+    }
   });
 }
 window.removeImage = () => {
@@ -715,15 +758,18 @@ window.removeImage = () => {
 
 window.submitPost = async () => {
   const content = document.getElementById('post-content').value.trim();
-  if (!content) return;
+  const fileInput = document.getElementById('post-image-input');
+  const file = fileInput?.files[0];
+  
+  if (!content && !file) return;
+  
   const btn = document.getElementById('post-submit-btn');
   btn.disabled = true;
   const formData = new FormData();
-  formData.append('content', content);
+  if (content) formData.append('content', content);
   const isStory = document.getElementById('story-toggle')?.checked;
   if (isStory) formData.append('is_story', 'true');
-  const fileInput = document.getElementById('post-image-input');
-  if (fileInput?.files[0]) formData.append('image', fileInput.files[0]);
+  if (file) formData.append('image', file);
   try {
     await posts.create(formData);
     document.getElementById('post-content').value = '';
@@ -739,9 +785,9 @@ window.submitPost = async () => {
 async function renderProfile() {
   const params = new URLSearchParams(window.location.search);
   const profileId = params.get('id') || state.user?.id;
-  const isOwn = parseInt(profileId) === state.user?.id;
+  const isOwn = String(profileId) === String(state.user?.id);
 
-  app.innerHTML = `${navbar()}<div class="container" style="max-width:900px;padding-top:1.5rem;">${spinner()}</div>`;
+  app.innerHTML = `${navbar()}<div class="container" id="profile-container" style="max-width:900px;padding-top:1.5rem;">${spinner()}</div>`;
   setupNavSearch();
 
   try {
@@ -751,7 +797,7 @@ async function renderProfile() {
 
     const followBtnHtml = !isOwn ? `
       <button class="btn ${u.followStatus === 'accepted' ? 'btn-outline' : u.followStatus === 'pending' ? 'btn-ghost' : 'btn-primary'}"
-        id="follow-profile-btn" onclick="toggleFollowProfile(${u.id}, '${u.followStatus || ''}')">
+        id="follow-profile-btn" onclick="toggleFollowProfile('${u.id}', '${u.followStatus || ''}')">
         ${u.followStatus === 'accepted' ? 'Following' : u.followStatus === 'pending' ? '⏳ Request Sent' : 'Follow'}
       </button>
       ${canMessage ? `
@@ -763,13 +809,13 @@ async function renderProfile() {
       </button>`;
 
     const profilePic = u.profilePicture
-      ? `<img src="${API_URL}${u.profilePicture}" class="avatar avatar-xl" alt="avatar">`
+      ? `<img src="${getImageUrl(u.profilePicture)}" class="avatar avatar-xl" alt="avatar">`
       : `<div class="avatar avatar-xl">${(u.fullName||'U').charAt(0)}</div>`;
 
     const postsHtml = u.posts?.length
       ? u.posts.map(p => `
         <div class="profile-grid-item">
-          ${p.imageUrl ? `<img src="${API_URL}${p.imageUrl}" alt="post" loading="lazy">` : `<div class="grid-no-img"><i class="ph ph-text-aa"></i></div>`}
+          ${p.imageUrl ? (p.imageUrl.match(/\.(mp4|webm|mov|avi)$/i) ? `<video src="${getImageUrl(p.imageUrl)}" loading="lazy"></video>` : `<img src="${getImageUrl(p.imageUrl)}" alt="post" loading="lazy">`) : `<div class="grid-no-img" style="padding:1rem;text-align:center;font-size:0.9rem;word-break:break-word;display:flex;align-items:center;justify-content:center;">${esc(p.content.substring(0, 100))}${p.content.length > 100 ? '...' : ''}</div>`}
           <div class="grid-overlay">
             <span><i class="ph ph-heart"></i> ${p.likesCount}</span>
             <span><i class="ph ph-chat-circle"></i> ${p.commentsCount}</span>
@@ -777,7 +823,18 @@ async function renderProfile() {
         </div>`).join('')
       : '<div class="empty-state" style="grid-column:1/-1"><i class="ph ph-image-square"></i><p>No posts yet</p></div>';
 
-    document.querySelector('.container').innerHTML = `
+    const repostsHtml = u.reposts?.length
+      ? u.reposts.map(p => `
+        <div class="profile-grid-item">
+          ${p.imageUrl ? (p.imageUrl.match(/\.(mp4|webm|mov|avi)$/i) ? `<video src="${getImageUrl(p.imageUrl)}" loading="lazy"></video>` : `<img src="${getImageUrl(p.imageUrl)}" alt="post" loading="lazy">`) : `<div class="grid-no-img" style="padding:1rem;text-align:center;font-size:0.9rem;word-break:break-word;display:flex;align-items:center;justify-content:center;">${esc(p.content.substring(0, 100))}${p.content.length > 100 ? '...' : ''}</div>`}
+          <div class="grid-overlay">
+            <span><i class="ph ph-heart"></i> ${p.likesCount}</span>
+            <span><i class="ph ph-chat-circle"></i> ${p.commentsCount}</span>
+          </div>
+        </div>`).join('')
+      : '<div class="empty-state" style="grid-column:1/-1"><i class="ph ph-arrows-clockwise"></i><p>No reposts yet</p></div>';
+
+    document.getElementById('profile-container').innerHTML = `
       <div class="card profile-header">
         <div class="profile-top">
           ${profilePic}
@@ -797,15 +854,50 @@ async function renderProfile() {
         </div>
       </div>
       <div class="card" style="margin-top:1rem;">
-        <div class="profile-tabs">
-          <div class="profile-tab active"><i class="ph ph-grid-four"></i> Posts</div>
+        <div class="profile-tabs" style="display:flex;border-bottom:1px solid var(--border);">
+          <div class="profile-tab active" id="tab-btn-posts" onclick="showProfileTab('posts')" style="flex:1;text-align:center;padding:1rem;cursor:pointer;border-bottom:2px solid var(--primary);font-weight:bold;"><i class="ph ph-grid-four"></i> Posts</div>
+          <div class="profile-tab text-muted" id="tab-btn-reposts" onclick="showProfileTab('reposts')" style="flex:1;text-align:center;padding:1rem;cursor:pointer;border-bottom:2px solid transparent;"><i class="ph ph-arrows-clockwise"></i> Reposts</div>
         </div>
-        <div class="profile-grid" style="padding:.5rem;">${postsHtml}</div>
+        <div class="profile-grid" id="profile-posts-grid" style="padding:.5rem;">${postsHtml}</div>
+        <div class="profile-grid" id="profile-reposts-grid" style="padding:.5rem;display:none;">${repostsHtml}</div>
       </div>`;
   } catch(e) {
-    document.querySelector('.container').innerHTML = `<p class="text-muted">${e.message}</p>`;
+    document.getElementById('profile-container').innerHTML = `<p class="text-muted">${e.message}</p>`;
   }
 }
+
+window.showProfileTab = (tab) => {
+  const postsGrid = document.getElementById('profile-posts-grid');
+  const repostsGrid = document.getElementById('profile-reposts-grid');
+  const postsBtn = document.getElementById('tab-btn-posts');
+  const repostsBtn = document.getElementById('tab-btn-reposts');
+  
+  if (tab === 'posts') {
+    postsGrid.style.display = 'grid';
+    repostsGrid.style.display = 'none';
+    postsBtn.classList.add('active');
+    postsBtn.classList.remove('text-muted');
+    postsBtn.style.borderBottomColor = 'var(--primary)';
+    postsBtn.style.fontWeight = 'bold';
+    
+    repostsBtn.classList.remove('active');
+    repostsBtn.classList.add('text-muted');
+    repostsBtn.style.borderBottomColor = 'transparent';
+    repostsBtn.style.fontWeight = 'normal';
+  } else {
+    postsGrid.style.display = 'none';
+    repostsGrid.style.display = 'grid';
+    repostsBtn.classList.add('active');
+    repostsBtn.classList.remove('text-muted');
+    repostsBtn.style.borderBottomColor = 'var(--primary)';
+    repostsBtn.style.fontWeight = 'bold';
+    
+    postsBtn.classList.remove('active');
+    postsBtn.classList.add('text-muted');
+    postsBtn.style.borderBottomColor = 'transparent';
+    postsBtn.style.fontWeight = 'normal';
+  }
+};
 
 window.toggleFollowProfile = async (userId, followStatus) => {
   const btn = document.getElementById('follow-profile-btn');
@@ -923,7 +1015,7 @@ async function renderExplore() {
               </div>
             </div>
             <button class="btn ${u.followStatus==='accepted'?'btn-outline':u.followStatus==='pending'?'btn-ghost':'btn-primary'} btn-sm" id="follow-btn-${u.id}"
-              onclick="toggleFollowBtn(${u.id}, '${u.followStatus||''}')">
+              onclick="toggleFollowBtn('${u.id}', '${u.followStatus||''}')">
               ${u.followStatus==='accepted' ? 'Following' : u.followStatus==='pending' ? '⏳ Requested' : 'Follow'}
             </button>
           </div>`).join('')}</div>`;
@@ -1058,7 +1150,7 @@ async function loadConversations(activeId) {
       return;
     }
     list.innerHTML = data.map(c => `
-      <div class="conversation-item ${parseInt(activeId)===c.partnerId?'active':''}" id="conv-${c.partnerId}" onclick="openChat(${c.partnerId})">
+      <div class="conversation-item ${activeId === c.partnerId.toString() ? 'active' : ''}" id="conv-${c.partnerId}" onclick="openChat('${c.partnerId}')">
         ${avatarEl({fullName:c.partnerFullName,profilePicture:c.partnerProfilePicture},'md')}
         <div class="conversation-info">
           <div class="conversation-name">${esc(c.partnerFullName)}</div>
@@ -1077,40 +1169,62 @@ let chatInterval = null;
 
 window.openChat = async (userId) => {
   clearInterval(chatInterval);
-  chatUserId = parseInt(userId);
+  chatUserId = userId;
   document.querySelectorAll('.conversation-item').forEach(el => el.classList.remove('active'));
   const convEl = document.getElementById(`conv-${userId}`);
   if (convEl) convEl.classList.add('active');
 
-  // Get partner info
-  let partnerName = 'User';
-  let partnerPic = null;
-  const convData = document.querySelector(`#conv-${userId} .conversation-name`);
-  if (convData) partnerName = convData.textContent;
-
   const chatArea = document.getElementById('chat-area');
-  chatArea.innerHTML = `
-    <div class="chat-header">
-      <button class="btn btn-ghost btn-sm" onclick="window.appNavigate('/profile?id=${userId}')">
-        ${avatarEl({fullName:partnerName},'sm')}
-      </button>
-      <div>
-        <div style="font-weight:600;">${esc(partnerName)}</div>
-        <div id="partner-status" class="text-muted" style="font-size:.75rem;"></div>
+  chatArea.innerHTML = `<div style="padding:2rem;text-align:center;">${spinner()}</div>`;
+
+  try {
+    const profile = await users.getProfile(userId);
+    const partnerName = profile.fullName;
+    const isBlocked = profile.isBlocked;
+
+    chatArea.innerHTML = `
+      <div class="chat-header">
+        <button class="btn btn-ghost btn-sm" onclick="window.appNavigate('/profile?id=${userId}')">
+          ${avatarEl({fullName:partnerName, profilePicture: profile.profilePicture},'sm')}
+        </button>
+        <div style="flex:1;">
+          <div style="font-weight:600;">${esc(partnerName)}</div>
+          <div id="partner-status" class="text-muted" style="font-size:.75rem;"></div>
+        </div>
+        ${isBlocked ? '' : `<button class="btn btn-ghost btn-sm" onclick="blockUserPermanently('${userId}')" style="color:var(--error);">Block</button>`}
       </div>
-    </div>
-    <div class="chat-messages" id="chat-messages-area">${spinner()}</div>
-    <div class="chat-input-area">
-      <input class="form-control chat-input" id="chat-msg-input" placeholder="Type a message…">
-      <button class="btn btn-primary btn-sm" onclick="sendChatMessage()"><i class="ph ph-paper-plane-tilt"></i></button>
-    </div>`;
+      <div class="chat-messages" id="chat-messages-area">${spinner()}</div>
+      ${isBlocked ? `<div style="text-align:center;padding:1rem;background:rgba(255,0,0,0.1);color:var(--error);">You have permanently blocked this user.</div>` : `
+      <div class="chat-input-area">
+        <input class="form-control chat-input" id="chat-msg-input" placeholder="Type a message…">
+        <button class="btn btn-primary btn-sm" onclick="sendChatMessage()"><i class="ph ph-paper-plane-tilt"></i></button>
+      </div>`}
+    `;
 
-  await loadChatMessages(userId);
-  chatInterval = setInterval(() => loadChatMessages(userId), 5000);
+    await loadChatMessages(userId);
+    chatInterval = setInterval(() => loadChatMessages(userId), 5000);
 
-  document.getElementById('chat-msg-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') sendChatMessage();
-  });
+    const input = document.getElementById('chat-msg-input');
+    if (input) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') sendChatMessage();
+      });
+    }
+  } catch(e) {
+    chatArea.innerHTML = `<p class="text-muted" style="padding:2rem;text-align:center;">Error loading chat</p>`;
+  }
+};
+
+window.blockUserPermanently = async (userId) => {
+  if (!confirm('Are you sure you want to permanently block this user? This action cannot be undone.')) return;
+  try {
+    await users.block(userId);
+    showToast('User permanently blocked', 'success');
+    document.getElementById(`conv-${userId}`)?.remove();
+    openChat(userId);
+  } catch (e) {
+    showToast(e.message, 'error');
+  }
 };
 
 async function loadChatMessages(userId) {
