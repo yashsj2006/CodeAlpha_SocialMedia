@@ -1,21 +1,25 @@
-const pool = require('../config/db');
+const { Notification } = require('../models');
 
 exports.getNotifications = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const [notifications] = await pool.query(`
-      SELECT n.id, n.type, n.is_read as isRead, n.created_at as createdAt,
-             n.post_id as postId,
-             u.id as actorId, u.full_name as actorFullName,
-             u.username as actorUsername,
-             u.profile_picture as actorProfilePicture
-      FROM Notifications n
-      JOIN Users u ON u.id = n.actor_id
-      WHERE n.user_id = ?
-      ORDER BY n.created_at DESC
-      LIMIT 60
-    `, [userId]);
-    res.json(notifications);
+    const notifications = await Notification.find({ user_id: req.user.id })
+      .populate('actor_id', 'full_name username profile_picture')
+      .populate('post_id', 'image_url')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json(notifications.map(n => ({
+      id: n._id,
+      type: n.type,
+      isRead: n.is_read,
+      createdAt: n.createdAt,
+      postId: n.post_id ? n.post_id._id : null,
+      postImage: n.post_id ? n.post_id.image_url : null,
+      actorId: n.actor_id._id,
+      actorFullName: n.actor_id.full_name,
+      actorUsername: n.actor_id.username,
+      actorProfilePicture: n.actor_id.profile_picture
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -23,8 +27,8 @@ exports.getNotifications = async (req, res) => {
 
 exports.markAllRead = async (req, res) => {
   try {
-    await pool.query('UPDATE Notifications SET is_read = 1 WHERE user_id = ?', [req.user.id]);
-    res.json({ message: 'All notifications marked as read' });
+    await Notification.updateMany({ user_id: req.user.id, is_read: false }, { $set: { is_read: true } });
+    res.json({ message: 'Notifications marked as read' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -32,10 +36,7 @@ exports.markAllRead = async (req, res) => {
 
 exports.getUnreadCount = async (req, res) => {
   try {
-    const [[{ count }]] = await pool.query(
-      'SELECT COUNT(*) as count FROM Notifications WHERE user_id = ? AND is_read = 0',
-      [req.user.id]
-    );
+    const count = await Notification.countDocuments({ user_id: req.user.id, is_read: false });
     res.json({ count });
   } catch (error) {
     res.status(500).json({ message: error.message });

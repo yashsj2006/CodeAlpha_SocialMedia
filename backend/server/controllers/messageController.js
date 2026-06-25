@@ -1,27 +1,46 @@
-const pool = require('../config/db');
+const { Message, User } = require('../models');
 
 exports.getConversations = async (req, res) => {
   try {
     const userId = req.user.id;
-    // Get latest message per conversation partner
-    const [rows] = await pool.query(`
-      SELECT 
-        m.id, m.content, m.is_read as isRead, m.created_at as createdAt,
-        m.sender_id as senderId, m.receiver_id as receiverId,
-        u.id as partnerId, u.full_name as partnerFullName,
-        u.username as partnerUsername,
-        u.profile_picture as partnerProfilePicture,
-        u.last_active as partnerLastActive
-      FROM Messages m
-      JOIN Users u ON u.id = IF(m.sender_id = ?, m.receiver_id, m.sender_id)
-      WHERE m.id IN (
-        SELECT MAX(id) FROM Messages
-        WHERE sender_id = ? OR receiver_id = ?
-        GROUP BY LEAST(sender_id, receiver_id), GREATEST(sender_id, receiver_id)
-      )
-      ORDER BY m.created_at DESC
-    `, [userId, userId, userId]);
-    res.json(rows);
+    
+    // Find all messages involving the user
+    const messages = await Message.find({
+      $or: [{ sender_id: userId }, { receiver_id: userId }]
+    }).sort({ createdAt: -1 });
+
+    const me = await User.findById(userId);
+    const myBlocked = me.blocked_users || [];
+
+    const conversationsMap = new Map();
+    for (const msg of messages) {
+      const otherId = msg.sender_id.toString() === userId.toString() ? msg.receiver_id : msg.sender_id;
+      if (!conversationsMap.has(otherId.toString())) {
+        const otherUser = await User.findById(otherId);
+        if (otherUser) {
+          const theirBlocked = otherUser.blocked_users || [];
+          if (!myBlocked.includes(otherId) && !theirBlocked.includes(userId)) {
+            conversationsMap.set(otherId.toString(), {
+              partnerId: otherUser._id,
+              partnerFullName: otherUser.full_name,
+              partnerUsername: otherUser.username,
+              partnerProfilePicture: otherUser.profile_picture,
+              content: msg.content,
+              createdAt: msg.createdAt,
+              isRead: msg.is_read,
+              receiverId: msg.receiver_id
+            });
+          }
+        }
+      } else {
+        if (msg.receiver_id.toString() === userId.toString() && !msg.is_read) {
+          const conv = conversationsMap.get(otherId.toString());
+          conv.unreadCount += 1;
+        }
+      }
+    }
+
+    res.json(Array.from(conversationsMap.values()));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -30,25 +49,29 @@ exports.getConversations = async (req, res) => {
 exports.getMessages = async (req, res) => {
   try {
     const userId = req.user.id;
-    const partnerId = req.params.userId;
+    const otherId = req.params.userId;
 
-    const [messages] = await pool.query(`
-      SELECT m.id, m.content, m.is_read as isRead,
-             m.created_at as createdAt,
-             m.sender_id as senderId, m.receiver_id as receiverId
-      FROM Messages m
-      WHERE (m.sender_id = ? AND m.receiver_id = ?)
-         OR (m.sender_id = ? AND m.receiver_id = ?)
-      ORDER BY m.created_at ASC
-    `, [userId, partnerId, partnerId, userId]);
+    const messages = await Message.find({
+      $or: [
+        { sender_id: userId, receiver_id: otherId },
+        { sender_id: otherId, receiver_id: userId }
+      ]
+    }).sort({ createdAt: 1 });
 
     // Mark as read
-    await pool.query(
-      'UPDATE Messages SET is_read = 1 WHERE sender_id = ? AND receiver_id = ?',
-      [partnerId, userId]
+    await Message.updateMany(
+      { sender_id: otherId, receiver_id: userId, is_read: false },
+      { $set: { is_read: true } }
     );
 
-    res.json(messages);
+    res.json(messages.map(m => ({
+      id: m._id,
+      senderId: m.sender_id,
+      receiverId: m.receiver_id,
+      content: m.content,
+      isRead: m.is_read,
+      createdAt: m.createdAt
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -56,31 +79,42 @@ exports.getMessages = async (req, res) => {
 
 exports.sendMessage = async (req, res) => {
   try {
-    const senderId   = req.user.id;
-    const receiverId = parseInt(req.params.userId);
     const { content } = req.body;
+    const receiverId = req.params.userId;
+    const senderId = req.user.id;
 
-    if (!content || !content.trim())
-      return res.status(400).json({ message: 'Message cannot be empty' });
+    if (!content || !content.trim()) return res.status(400).json({ message: 'Content required' });
 
-    // Allow ONLY if there is an accepted follow relationship
-    const [follows] = await pool.query(
-      "SELECT id FROM Followers WHERE ((follower_id = ? AND following_id = ?) OR (follower_id = ? AND following_id = ?)) AND status = 'accepted'",
-      [senderId, receiverId, receiverId, senderId]
-    );
-    if (!follows.length)
-      return res.status(403).json({ message: 'You can only message accepted followers' });
+    const sender = await User.findById(senderId);
+    const receiver = await User.findById(receiverId);
 
-    const [result] = await pool.query(
-      'INSERT INTO Messages (sender_id, receiver_id, content) VALUES (?, ?, ?)',
-      [senderId, receiverId, content.trim()]
-    );
+    if (!sender || !receiver) return res.status(404).json({ message: 'User not found' });
 
-    const [rows] = await pool.query(
-      'SELECT id, content, is_read as isRead, created_at as createdAt, sender_id as senderId, receiver_id as receiverId FROM Messages WHERE id = ?',
-      [result.insertId]
-    );
-    res.status(201).json(rows[0]);
+    if (sender.blocked_users.includes(receiverId) || receiver.blocked_users.includes(senderId)) {
+      return res.status(403).json({ message: 'You cannot send messages to this user' });
+    }
+
+    const msg = await Message.create({
+      sender_id: senderId,
+      receiver_id: receiverId,
+      content
+    });
+
+    const newMessage = {
+      id: msg._id,
+      senderId: msg.sender_id,
+      receiverId: msg.receiver_id,
+      content: msg.content,
+      isRead: msg.is_read,
+      createdAt: msg.createdAt
+    };
+
+    // Socket.io integration: Emit to receiver if connected
+    if (req.io) {
+      req.io.to(receiverId.toString()).emit('receiveMessage', newMessage);
+    }
+
+    res.status(201).json(newMessage);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -88,11 +122,8 @@ exports.sendMessage = async (req, res) => {
 
 exports.getUnreadCount = async (req, res) => {
   try {
-    const [[{ count }]] = await pool.query(
-      'SELECT COUNT(*) as count FROM Messages WHERE receiver_id = ? AND is_read = 0',
-      [req.user.id]
-    );
-    res.json({ count });
+    const count = await Message.countDocuments({ receiver_id: req.user.id, is_read: false });
+    res.json({ unreadCount: count });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

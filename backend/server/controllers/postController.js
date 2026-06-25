@@ -1,20 +1,10 @@
-const pool = require('../config/db');
-const path = require('path');
+const { Post, User, Follow, Comment, Notification } = require('../models');
 
-// Helper: parse and store hashtags from content
 async function processHashtags(postId, content) {
   if (!content) return;
   const tags = [...new Set((content.match(/#(\w+)/g) || []).map(t => t.slice(1).toLowerCase()))];
-  for (const tag of tags) {
-    const [rows] = await pool.query('INSERT IGNORE INTO Hashtags (tag) VALUES (?)', [tag]);
-    let hashtagId;
-    if (rows.insertId) {
-      hashtagId = rows.insertId;
-    } else {
-      const [existing] = await pool.query('SELECT id FROM Hashtags WHERE tag = ?', [tag]);
-      hashtagId = existing[0].id;
-    }
-    await pool.query('INSERT IGNORE INTO PostHashtags (post_id, hashtag_id) VALUES (?, ?)', [postId, hashtagId]);
+  if (tags.length > 0) {
+    await Post.findByIdAndUpdate(postId, { $addToSet: { hashtags: { $each: tags } } });
   }
 }
 
@@ -23,34 +13,38 @@ exports.createPost = async (req, res) => {
     const { content, is_story } = req.body;
     let imageUrl = null;
     if (req.file) {
-      imageUrl = '/uploads/' + req.file.filename;
+      imageUrl = req.file.path; // Cloudinary URL
     }
 
     if ((!content || !content.trim()) && !imageUrl) {
       return res.status(400).json({ message: 'Post content or image is required' });
     }
-    const isStory = is_story === 'true' || is_story === true ? 1 : 0;
+    const isStory = is_story === 'true' || is_story === true;
     const expiresAt = isStory ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null;
 
-    const [result] = await pool.query(
-      'INSERT INTO Posts (user_id, content, image_url, is_story, expires_at) VALUES (?, ?, ?, ?, ?)',
-      [req.user.id, content, imageUrl, isStory, expiresAt]
-    );
+    const post = await Post.create({
+      user_id: req.user.id,
+      content,
+      image_url: imageUrl,
+      is_story: isStory,
+      expires_at: expiresAt
+    });
 
-    await processHashtags(result.insertId, content);
+    await processHashtags(post._id, content);
 
-    const [posts] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl, p.is_story as isStory,
-             p.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture
-      FROM Posts p
-      JOIN Users u ON p.user_id = u.id
-      WHERE p.id = ?
-    `, [result.insertId]);
+    const populatedPost = await Post.findById(post._id).populate('user_id', 'full_name username profile_picture');
 
-    res.status(201).json(posts[0]);
+    res.status(201).json({
+      id: populatedPost._id,
+      content: populatedPost.content,
+      imageUrl: populatedPost.image_url,
+      isStory: populatedPost.is_story,
+      createdAt: populatedPost.createdAt,
+      authorId: populatedPost.user_id._id,
+      authorFullName: populatedPost.user_id.full_name,
+      authorUsername: populatedPost.user_id.username,
+      authorProfilePicture: populatedPost.user_id.profile_picture
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -59,37 +53,44 @@ exports.createPost = async (req, res) => {
 exports.getPosts = async (req, res) => {
   try {
     const userId = req.user ? req.user.id : null;
-    const [posts] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl, p.is_story as isStory,
-             p.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture,
-             (SELECT COUNT(*) FROM Likes WHERE post_id = p.id) as likesCount,
-             (SELECT COUNT(*) FROM Comments WHERE post_id = p.id) as commentsCount,
-             (SELECT COUNT(*) FROM Shares WHERE original_post_id = p.id) as sharesCount
-      FROM Posts p
-      JOIN Users u ON p.user_id = u.id
-      WHERE p.is_story = 0
-        AND (p.expires_at IS NULL OR p.expires_at > NOW())
-        AND (p.user_id = ? OR p.user_id IN (SELECT following_id FROM Followers WHERE follower_id = ?))
-      ORDER BY p.created_at DESC
-    `, [userId, userId]);
+    let userFilter = {};
 
-    let userLikes = [];
-    let userSaves = [];
     if (userId) {
-      const [likes] = await pool.query('SELECT post_id FROM Likes WHERE user_id = ?', [userId]);
-      userLikes = likes.map(l => l.post_id);
-      const [saves] = await pool.query('SELECT post_id FROM Saves WHERE user_id = ?', [userId]);
-      userSaves = saves.map(s => s.post_id);
+      const follows = await Follow.find({ follower_id: userId });
+      const followingIds = follows.map(f => f.following_id);
+      followingIds.push(userId); // include own posts
+      userFilter = { user_id: { $in: followingIds } };
     }
 
-    const formattedPosts = posts.map(p => ({
-      ...p,
-      isLiked: userLikes.includes(p.id),
-      isSaved: userSaves.includes(p.id)
-    }));
+    const posts = await Post.find({
+      is_story: false,
+      $or: [{ expires_at: null }, { expires_at: { $gt: new Date() } }],
+      ...userFilter
+    })
+    .populate('user_id', 'full_name username profile_picture')
+    .sort({ createdAt: -1 })
+    .lean();
+
+    const formattedPosts = [];
+    for (const p of posts) {
+      const commentsCount = await Comment.countDocuments({ post_id: p._id });
+      formattedPosts.push({
+        id: p._id,
+        content: p.content,
+        imageUrl: p.image_url,
+        isStory: p.is_story,
+        createdAt: p.createdAt,
+        authorId: p.user_id._id,
+        authorFullName: p.user_id.full_name,
+        authorUsername: p.user_id.username,
+        authorProfilePicture: p.user_id.profile_picture,
+        likesCount: p.likes ? p.likes.length : 0,
+        commentsCount,
+        sharesCount: p.shares ? p.shares.length : 0,
+        isLiked: userId ? (p.likes || []).some(l => l.toString() === userId.toString()) : false,
+        isSaved: userId ? (p.saves || []).some(s => s.toString() === userId.toString()) : false
+      });
+    }
 
     res.json(formattedPosts);
   } catch (error) {
@@ -100,19 +101,31 @@ exports.getPosts = async (req, res) => {
 exports.getStories = async (req, res) => {
   try {
     const userId = req.user.id;
-    const [stories] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl,
-             p.created_at as createdAt, p.expires_at as expiresAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture
-      FROM Posts p
-      JOIN Users u ON p.user_id = u.id
-      WHERE p.is_story = 1 AND p.expires_at > NOW()
-        AND (p.user_id = ? OR p.user_id IN (SELECT following_id FROM Followers WHERE follower_id = ?))
-      ORDER BY p.created_at DESC
-    `, [userId, userId]);
-    res.json(stories);
+    const follows = await Follow.find({ follower_id: userId });
+    const followingIds = follows.map(f => f.following_id);
+    followingIds.push(userId);
+
+    const stories = await Post.find({
+      is_story: true,
+      expires_at: { $gt: new Date() },
+      user_id: { $in: followingIds }
+    })
+    .populate('user_id', 'full_name username profile_picture')
+    .sort({ createdAt: -1 })
+    .lean();
+
+    res.json(stories.map(p => ({
+      id: p._id,
+      content: p.content,
+      imageUrl: p.image_url,
+      createdAt: p.createdAt,
+      expiresAt: p.expires_at,
+      authorId: p.user_id._id,
+      authorFullName: p.user_id.full_name,
+      authorUsername: p.user_id.username,
+      authorProfilePicture: p.user_id.profile_picture,
+      isLiked: (p.story_likes || []).some(l => l.toString() === userId.toString())
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -120,10 +133,11 @@ exports.getStories = async (req, res) => {
 
 exports.deletePost = async (req, res) => {
   try {
-    const [posts] = await pool.query('SELECT user_id FROM Posts WHERE id = ?', [req.params.id]);
-    if (posts.length === 0) return res.status(404).json({ message: 'Post not found' });
-    if (posts[0].user_id !== req.user.id) return res.status(401).json({ message: 'Not authorized' });
-    await pool.query('DELETE FROM Posts WHERE id = ?', [req.params.id]);
+    const post = await Post.findById(req.params.id);
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    if (post.user_id.toString() !== req.user.id.toString()) return res.status(401).json({ message: 'Not authorized' });
+    
+    await Post.findByIdAndDelete(req.params.id);
     res.json({ message: 'Post removed' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -133,32 +147,43 @@ exports.deletePost = async (req, res) => {
 exports.getExplorePosts = async (req, res) => {
   try {
     const userId = req.user.id;
-    const [posts] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl,
-             p.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture,
-             (SELECT COUNT(*) FROM Likes WHERE post_id = p.id) as likesCount,
-             (SELECT COUNT(*) FROM Comments WHERE post_id = p.id) as commentsCount
-      FROM Posts p
-      JOIN Users u ON p.user_id = u.id
-      WHERE p.is_story = 0
-        AND p.user_id NOT IN (
-          SELECT following_id FROM Followers WHERE follower_id = ?
-        )
-        AND p.user_id != ?
-        AND (p.expires_at IS NULL OR p.expires_at > NOW())
-      ORDER BY likesCount DESC, p.created_at DESC
-      LIMIT 50
-    `, [userId, userId]);
+    const follows = await Follow.find({ follower_id: userId });
+    const followingIds = follows.map(f => f.following_id);
+    followingIds.push(userId);
 
-    const [likes] = await pool.query('SELECT post_id FROM Likes WHERE user_id = ?', [userId]);
-    const userLikes = likes.map(l => l.post_id);
-    const [saves] = await pool.query('SELECT post_id FROM Saves WHERE user_id = ?', [userId]);
-    const userSaves = saves.map(s => s.post_id);
+    const posts = await Post.find({
+      is_story: false,
+      user_id: { $nin: followingIds },
+      $or: [{ expires_at: null }, { expires_at: { $gt: new Date() } }]
+    })
+    .populate('user_id', 'full_name username profile_picture')
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .lean();
+    
+    // Sort by likesCount in memory
+    posts.sort((a, b) => (b.likes ? b.likes.length : 0) - (a.likes ? a.likes.length : 0));
 
-    res.json(posts.map(p => ({ ...p, isLiked: userLikes.includes(p.id), isSaved: userSaves.includes(p.id) })));
+    const formattedPosts = [];
+    for (const p of posts) {
+      const commentsCount = await Comment.countDocuments({ post_id: p._id });
+      formattedPosts.push({
+        id: p._id,
+        content: p.content,
+        imageUrl: p.image_url,
+        createdAt: p.createdAt,
+        authorId: p.user_id._id,
+        authorFullName: p.user_id.full_name,
+        authorUsername: p.user_id.username,
+        authorProfilePicture: p.user_id.profile_picture,
+        likesCount: p.likes ? p.likes.length : 0,
+        commentsCount,
+        isLiked: (p.likes || []).some(l => l.toString() === userId.toString()),
+        isSaved: (p.saves || []).some(s => s.toString() === userId.toString())
+      });
+    }
+
+    res.json(formattedPosts);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -168,26 +193,34 @@ exports.getHashtagPosts = async (req, res) => {
   try {
     const tag = req.params.tag.toLowerCase();
     const userId = req.user.id;
-    const [posts] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl,
-             p.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture,
-             (SELECT COUNT(*) FROM Likes WHERE post_id = p.id) as likesCount,
-             (SELECT COUNT(*) FROM Comments WHERE post_id = p.id) as commentsCount
-      FROM Posts p
-      JOIN Users u ON p.user_id = u.id
-      JOIN PostHashtags ph ON ph.post_id = p.id
-      JOIN Hashtags h ON h.id = ph.hashtag_id
-      WHERE h.tag = ? AND p.is_story = 0
-        AND (p.expires_at IS NULL OR p.expires_at > NOW())
-      ORDER BY p.created_at DESC
-    `, [tag]);
 
-    const [likes] = await pool.query('SELECT post_id FROM Likes WHERE user_id = ?', [userId]);
-    const userLikes = likes.map(l => l.post_id);
-    res.json(posts.map(p => ({ ...p, isLiked: userLikes.includes(p.id) })));
+    const posts = await Post.find({
+      is_story: false,
+      hashtags: tag,
+      $or: [{ expires_at: null }, { expires_at: { $gt: new Date() } }]
+    })
+    .populate('user_id', 'full_name username profile_picture')
+    .sort({ createdAt: -1 })
+    .lean();
+
+    const formattedPosts = [];
+    for (const p of posts) {
+      const commentsCount = await Comment.countDocuments({ post_id: p._id });
+      formattedPosts.push({
+        id: p._id,
+        content: p.content,
+        imageUrl: p.image_url,
+        createdAt: p.createdAt,
+        authorId: p.user_id._id,
+        authorFullName: p.user_id.full_name,
+        authorUsername: p.user_id.username,
+        authorProfilePicture: p.user_id.profile_picture,
+        likesCount: p.likes ? p.likes.length : 0,
+        commentsCount,
+        isLiked: (p.likes || []).some(l => l.toString() === userId.toString())
+      });
+    }
+    res.json(formattedPosts);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -195,17 +228,24 @@ exports.getHashtagPosts = async (req, res) => {
 
 exports.getTrending = async (req, res) => {
   try {
-    const [tags] = await pool.query(`
-      SELECT h.tag, COUNT(ph.post_id) as count
-      FROM PostHashtags ph
-      JOIN Hashtags h ON h.id = ph.hashtag_id
-      JOIN Posts p ON p.id = ph.post_id
-      WHERE p.created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-      GROUP BY h.id
-      ORDER BY count DESC
-      LIMIT 10
-    `);
-    res.json(tags);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const posts = await Post.find({ createdAt: { $gt: yesterday } }).lean();
+    
+    const tagCounts = {};
+    posts.forEach(p => {
+      if (p.hashtags) {
+        p.hashtags.forEach(tag => {
+          tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        });
+      }
+    });
+
+    const sortedTags = Object.entries(tagCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([tag, count]) => ({ tag, count }));
+
+    res.json(sortedTags);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -216,18 +256,23 @@ exports.repost = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    const [existing] = await pool.query('SELECT id FROM Shares WHERE user_id = ? AND original_post_id = ?', [userId, postId]);
-    if (existing.length > 0) return res.status(400).json({ message: 'Already reposted' });
+    const post = await Post.findById(postId);
+    if (!post) return res.status(404).json({ message: 'Post not found' });
+    
+    if (post.shares && post.shares.some(s => s.toString() === userId.toString())) {
+      return res.status(400).json({ message: 'Already reposted' });
+    }
 
-    await pool.query('INSERT INTO Shares (user_id, original_post_id) VALUES (?, ?)', [userId, postId]);
+    await Post.findByIdAndUpdate(postId, { $addToSet: { shares: userId } });
 
-    // Notify original post author
-    const [postRows] = await pool.query('SELECT user_id FROM Posts WHERE id = ?', [postId]);
-    if (postRows.length > 0 && postRows[0].user_id !== userId) {
-      await pool.query(
-        'INSERT INTO Notifications (user_id, actor_id, type, post_id) VALUES (?, ?, ?, ?)',
-        [postRows[0].user_id, userId, 'repost', postId]
-      );
+    if (post.user_id.toString() !== userId.toString()) {
+      await Notification.create({
+        user_id: post.user_id,
+        actor_id: userId,
+        type: 'repost',
+        post_id: postId
+      });
+      if (req.io) req.io.to(post.user_id.toString()).emit('newNotification');
     }
 
     res.json({ message: 'Reposted' });
@@ -241,13 +286,13 @@ exports.viewStory = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    const [posts] = await pool.query('SELECT is_story, user_id FROM Posts WHERE id = ?', [postId]);
-    if (posts.length === 0 || posts[0].is_story === 0) {
+    const post = await Post.findById(postId);
+    if (!post || !post.is_story) {
       return res.status(404).json({ message: 'Story not found' });
     }
     
-    if (posts[0].user_id !== userId) {
-      await pool.query('INSERT IGNORE INTO StoryViews (post_id, user_id) VALUES (?, ?)', [postId, userId]);
+    if (post.user_id.toString() !== userId.toString()) {
+      await Post.findByIdAndUpdate(postId, { $addToSet: { story_views: userId } });
     }
     res.json({ message: 'Story viewed' });
   } catch (error) {
@@ -258,26 +303,26 @@ exports.viewStory = async (req, res) => {
 exports.getStoryStats = async (req, res) => {
   try {
     const postId = req.params.id;
-    const userId = req.user.id;
+    const post = await Post.findById(postId)
+      .populate('story_views', 'full_name username profile_picture')
+      .populate('story_likes', 'full_name username profile_picture')
+      .lean();
+      
+    if (!post) return res.status(404).json({ message: 'Story not found' });
 
-    const [posts] = await pool.query('SELECT user_id FROM Posts WHERE id = ?', [postId]);
-    if (posts.length === 0) return res.status(404).json({ message: 'Story not found' });
+    const viewers = (post.story_views || []).map(u => ({
+      id: u._id,
+      fullName: u.full_name,
+      username: u.username,
+      profilePicture: u.profile_picture
+    }));
 
-    const [viewers] = await pool.query(`
-      SELECT u.id, u.full_name as fullName, u.username, u.profile_picture as profilePicture, sv.created_at as viewedAt
-      FROM StoryViews sv
-      JOIN Users u ON sv.user_id = u.id
-      WHERE sv.post_id = ?
-      ORDER BY sv.created_at DESC
-    `, [postId]);
-
-    const [likers] = await pool.query(`
-      SELECT u.id, u.full_name as fullName, u.username, u.profile_picture as profilePicture, sl.created_at as likedAt
-      FROM StoryLikes sl
-      JOIN Users u ON sl.user_id = u.id
-      WHERE sl.post_id = ?
-      ORDER BY sl.created_at DESC
-    `, [postId]);
+    const likers = (post.story_likes || []).map(u => ({
+      id: u._id,
+      fullName: u.full_name,
+      username: u.username,
+      profilePicture: u.profile_picture
+    }));
 
     res.json({ viewers, likers });
   } catch (error) {

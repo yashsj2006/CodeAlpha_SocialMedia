@@ -1,128 +1,105 @@
-const pool = require('../config/db');
+const { Follow, User, Notification } = require('../models');
 
-// POST /follow/:id  →  sends a follow request (status = pending)
 exports.followUser = async (req, res) => {
   try {
-    const followingId = parseInt(req.params.id);
-    const followerId  = req.user.id;
+    const followerId = req.user.id;
+    const followingId = req.params.id;
 
-    if (followingId === followerId)
-      return res.status(400).json({ message: 'Cannot follow yourself' });
+    if (followerId.toString() === followingId.toString()) {
+      return res.status(400).json({ message: 'You cannot follow yourself' });
+    }
 
-    const [existing] = await pool.query(
-      'SELECT id, status FROM Followers WHERE follower_id = ? AND following_id = ?',
-      [followerId, followingId]
-    );
-    if (existing.length > 0)
-      return res.status(400).json({ message: existing[0].status === 'pending' ? 'Request already sent' : 'Already following' });
+    const existingFollow = await Follow.findOne({ follower_id: followerId, following_id: followingId });
+    if (existingFollow) return res.status(400).json({ message: 'Already following' });
 
-    await pool.query(
-      'INSERT INTO Followers (follower_id, following_id, status) VALUES (?, ?, ?)',
-      [followerId, followingId, 'pending']
-    );
+    await Follow.create({ follower_id: followerId, following_id: followingId });
 
-    // Notify target user about the follow request
-    await pool.query(
-      'INSERT INTO Notifications (user_id, actor_id, type) VALUES (?, ?, ?)',
-      [followingId, followerId, 'follow_request']
-    );
+    await Notification.create({
+      user_id: followingId,
+      actor_id: followerId,
+      type: 'follow'
+    });
+    if (req.io) req.io.to(followingId.toString()).emit('newNotification');
 
-    res.json({ message: 'Follow request sent' });
+    res.json({ message: 'Followed successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// POST /follow/:id/accept  →  accept a pending request
+exports.unfollowUser = async (req, res) => {
+  try {
+    await Follow.findOneAndDelete({ follower_id: req.user.id, following_id: req.params.id });
+    res.json({ message: 'Unfollowed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getFollowers = async (req, res) => {
+  try {
+    const follows = await Follow.find({ following_id: req.params.id })
+      .populate('follower_id', 'full_name username profile_picture');
+    
+    res.json(follows.map(f => ({
+      id: f.follower_id._id,
+      fullName: f.follower_id.full_name,
+      username: f.follower_id.username,
+      profilePicture: f.follower_id.profile_picture
+    })));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getFollowing = async (req, res) => {
+  try {
+    const follows = await Follow.find({ follower_id: req.params.id, status: 'accepted' })
+      .populate('following_id', 'full_name username profile_picture');
+
+    res.json(follows.map(f => ({
+      id: f.following_id._id,
+      fullName: f.following_id.full_name,
+      username: f.following_id.username,
+      profilePicture: f.following_id.profile_picture
+    })));
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 exports.acceptFollow = async (req, res) => {
   try {
-    const requesterId = parseInt(req.params.id); // the person who sent the request
-    const userId      = req.user.id;             // the person accepting
-
-    const [rows] = await pool.query(
-      'SELECT id FROM Followers WHERE follower_id = ? AND following_id = ? AND status = ?',
-      [requesterId, userId, 'pending']
+    await Follow.findOneAndUpdate(
+      { follower_id: req.params.id, following_id: req.user.id },
+      { $set: { status: 'accepted' } }
     );
-    if (!rows.length)
-      return res.status(404).json({ message: 'No pending request found' });
-
-    await pool.query(
-      'UPDATE Followers SET status = ? WHERE follower_id = ? AND following_id = ?',
-      ['accepted', requesterId, userId]
-    );
-
-    // Also create mutual follow relationship for messaging
-    await pool.query(
-      'INSERT IGNORE INTO Followers (follower_id, following_id, status) VALUES (?, ?, ?)',
-      [userId, requesterId, 'accepted']
-    );
-
-    // Notify requester that they were accepted
-    await pool.query(
-      'INSERT INTO Notifications (user_id, actor_id, type) VALUES (?, ?, ?)',
-      [requesterId, userId, 'follow_accept']
-    );
-
     res.json({ message: 'Follow request accepted' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// POST /follow/:id/decline  →  decline / delete a pending request
 exports.declineFollow = async (req, res) => {
   try {
-    const requesterId = parseInt(req.params.id);
-    const userId      = req.user.id;
-
-    await pool.query(
-      'DELETE FROM Followers WHERE follower_id = ? AND following_id = ? AND status = ?',
-      [requesterId, userId, 'pending']
-    );
-
-    // Also completely remove the notification so it vanishes from the UI
-    await pool.query(
-      "DELETE FROM Notifications WHERE actor_id = ? AND user_id = ? AND type = 'follow_request'",
-      [requesterId, userId]
-    );
-
-    res.json({ message: 'Follow request declined and removed completely' });
+    await Follow.findOneAndDelete({ follower_id: req.params.id, following_id: req.user.id });
+    res.json({ message: 'Follow request declined' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
 
-// POST /unfollow/:id  →  remove accepted follow OR cancel pending request
-exports.unfollowUser = async (req, res) => {
-  try {
-    const followingId = parseInt(req.params.id);
-    const followerId  = req.user.id;
-
-    await pool.query(
-      'DELETE FROM Followers WHERE follower_id = ? AND following_id = ?',
-      [followerId, followingId]
-    );
-
-    res.json({ message: 'Unfollowed' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-// GET /follow-requests  →  list pending requests directed at the logged-in user
 exports.getFollowRequests = async (req, res) => {
   try {
-    const userId = req.user.id;
-    const [rows] = await pool.query(`
-      SELECT f.id, f.created_at as createdAt,
-             u.id as requesterId, u.full_name as fullName,
-             u.username, u.profile_picture as profilePicture, u.bio
-      FROM Followers f
-      JOIN Users u ON u.id = f.follower_id
-      WHERE f.following_id = ? AND f.status = 'pending'
-      ORDER BY f.created_at DESC
-    `, [userId]);
-    res.json(rows);
+    const follows = await Follow.find({ following_id: req.user.id, status: 'pending' })
+      .populate('follower_id', 'full_name username profile_picture');
+      
+    res.json(follows.map(f => ({
+      id: f.follower_id._id,
+      fullName: f.follower_id.full_name,
+      username: f.follower_id.username,
+      profilePicture: f.follower_id.profile_picture
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

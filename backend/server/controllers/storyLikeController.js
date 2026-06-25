@@ -1,32 +1,29 @@
-const pool = require('../config/db');
+const { Post, Notification } = require('../models');
 
 exports.likeStory = async (req, res) => {
   try {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    // Verify it is actually a story
-    const [postRows] = await pool.query('SELECT user_id, is_story FROM Posts WHERE id = ?', [postId]);
-    if (!postRows.length) return res.status(404).json({ message: 'Story not found' });
-    if (!postRows[0].is_story) return res.status(400).json({ message: 'Not a story' });
-
-    await pool.query(
-      'INSERT IGNORE INTO StoryLikes (post_id, user_id) VALUES (?, ?)',
-      [postId, userId]
+    const post = await Post.findOneAndUpdate(
+      { _id: postId, is_story: true },
+      { $addToSet: { story_likes: userId } },
+      { new: true }
     );
 
-    // Notify story author
-    if (postRows[0].user_id !== userId) {
-      await pool.query(
-        'INSERT INTO Notifications (user_id, actor_id, type, post_id) VALUES (?, ?, ?, ?)',
-        [postRows[0].user_id, userId, 'story_like', postId]
-      );
+    if (!post) return res.status(404).json({ message: 'Story not found' });
+
+    if (post.user_id.toString() !== userId.toString()) {
+      await Notification.create({
+        user_id: post.user_id,
+        actor_id: userId,
+        type: 'story_like',
+        post_id: postId
+      });
+      if (req.io) req.io.to(post.user_id.toString()).emit('newNotification');
     }
 
-    const [[{ count }]] = await pool.query(
-      'SELECT COUNT(*) as count FROM StoryLikes WHERE post_id = ?', [postId]
-    );
-    res.json({ message: 'Story liked', likesCount: count });
+    res.json({ message: 'Story liked' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -37,15 +34,12 @@ exports.unlikeStory = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    await pool.query(
-      'DELETE FROM StoryLikes WHERE post_id = ? AND user_id = ?',
-      [postId, userId]
+    await Post.findOneAndUpdate(
+      { _id: postId, is_story: true },
+      { $pull: { story_likes: userId } }
     );
 
-    const [[{ count }]] = await pool.query(
-      'SELECT COUNT(*) as count FROM StoryLikes WHERE post_id = ?', [postId]
-    );
-    res.json({ message: 'Story unliked', likesCount: count });
+    res.json({ message: 'Story unliked' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

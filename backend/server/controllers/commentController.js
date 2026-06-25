@@ -1,36 +1,41 @@
-const pool = require('../config/db');
+const { Comment, Post, Notification } = require('../models');
 
 exports.addComment = async (req, res) => {
   try {
-    const { comment } = req.body;
+    const { content } = req.body;
     const postId = req.params.id;
     const userId = req.user.id;
 
-    const [result] = await pool.query(
-      'INSERT INTO Comments (post_id, user_id, comment) VALUES (?, ?, ?)',
-      [postId, userId, comment]
-    );
+    if (!content || !content.trim()) return res.status(400).json({ message: 'Content required' });
 
-    // Notify post author
-    const [postRows] = await pool.query('SELECT user_id FROM Posts WHERE id = ?', [postId]);
-    if (postRows.length > 0 && postRows[0].user_id !== userId) {
-      await pool.query(
-        'INSERT INTO Notifications (user_id, actor_id, type, post_id) VALUES (?, ?, ?, ?)',
-        [postRows[0].user_id, userId, 'comment', postId]
-      );
+    const comment = await Comment.create({
+      post_id: postId,
+      user_id: userId,
+      content
+    });
+
+    const populatedComment = await Comment.findById(comment._id).populate('user_id', 'full_name username profile_picture');
+
+    const post = await Post.findById(postId);
+    if (post && post.user_id.toString() !== userId.toString()) {
+      await Notification.create({
+        user_id: post.user_id,
+        actor_id: userId,
+        type: 'comment',
+        post_id: postId
+      });
+      if (req.io) req.io.to(post.user_id.toString()).emit('newNotification');
     }
 
-    const [comments] = await pool.query(`
-      SELECT c.id, c.comment, c.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture
-      FROM Comments c
-      JOIN Users u ON c.user_id = u.id
-      WHERE c.id = ?
-    `, [result.insertId]);
-
-    res.status(201).json(comments[0]);
+    res.status(201).json({
+      id: populatedComment._id,
+      content: populatedComment.content,
+      createdAt: populatedComment.createdAt,
+      authorId: populatedComment.user_id._id,
+      authorFullName: populatedComment.user_id.full_name,
+      authorUsername: populatedComment.user_id.username,
+      authorProfilePicture: populatedComment.user_id.profile_picture
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -38,17 +43,20 @@ exports.addComment = async (req, res) => {
 
 exports.getComments = async (req, res) => {
   try {
-    const [comments] = await pool.query(`
-      SELECT c.id, c.comment, c.created_at as createdAt,
-             u.id as authorId, u.full_name as authorFullName,
-             u.username as authorUsername,
-             u.profile_picture as authorProfilePicture
-      FROM Comments c
-      JOIN Users u ON c.user_id = u.id
-      WHERE c.post_id = ?
-      ORDER BY c.created_at ASC
-    `, [req.params.id]);
-    res.json(comments);
+    const comments = await Comment.find({ post_id: req.params.id })
+      .populate('user_id', 'full_name username profile_picture')
+      .sort({ createdAt: 1 })
+      .lean();
+
+    res.json(comments.map(c => ({
+      id: c._id,
+      content: c.content,
+      createdAt: c.createdAt,
+      authorId: c.user_id._id,
+      authorFullName: c.user_id.full_name,
+      authorUsername: c.user_id.username,
+      authorProfilePicture: c.user_id.profile_picture
+    })));
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -56,11 +64,13 @@ exports.getComments = async (req, res) => {
 
 exports.deleteComment = async (req, res) => {
   try {
-    const [comments] = await pool.query('SELECT user_id FROM Comments WHERE id = ?', [req.params.id]);
-    if (comments.length === 0) return res.status(404).json({ message: 'Comment not found' });
-    if (comments[0].user_id !== req.user.id) return res.status(401).json({ message: 'Not authorized' });
-    await pool.query('DELETE FROM Comments WHERE id = ?', [req.params.id]);
-    res.json({ message: 'Comment removed' });
+    const commentId = req.params.id;
+    const comment = await Comment.findById(commentId);
+    if (!comment) return res.status(404).json({ message: 'Comment not found' });
+    if (comment.user_id.toString() !== req.user.id.toString()) return res.status(401).json({ message: 'Not authorized' });
+
+    await Comment.findByIdAndDelete(commentId);
+    res.json({ message: 'Comment deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -1,28 +1,29 @@
-const pool = require('../config/db');
+const { Post, Notification } = require('../models');
 
 exports.likePost = async (req, res) => {
   try {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    const [existing] = await pool.query(
-      'SELECT id FROM Likes WHERE post_id = ? AND user_id = ?', [postId, userId]
+    const post = await Post.findByIdAndUpdate(
+      postId, 
+      { $addToSet: { likes: userId } },
+      { new: true }
     );
-    if (existing.length > 0) return res.status(400).json({ message: 'Already liked' });
 
-    await pool.query('INSERT INTO Likes (post_id, user_id) VALUES (?, ?)', [postId, userId]);
+    if (!post) return res.status(404).json({ message: 'Post not found' });
 
-    // Notify post author
-    const [postRows] = await pool.query('SELECT user_id FROM Posts WHERE id = ?', [postId]);
-    if (postRows.length > 0 && postRows[0].user_id !== userId) {
-      await pool.query(
-        'INSERT INTO Notifications (user_id, actor_id, type, post_id) VALUES (?, ?, ?, ?)',
-        [postRows[0].user_id, userId, 'like', postId]
-      );
+    if (post.user_id.toString() !== userId.toString()) {
+      await Notification.create({
+        user_id: post.user_id,
+        actor_id: userId,
+        type: 'like',
+        post_id: postId
+      });
+      if (req.io) req.io.to(post.user_id.toString()).emit('newNotification');
     }
 
-    const [count] = await pool.query('SELECT COUNT(*) as c FROM Likes WHERE post_id = ?', [postId]);
-    res.json({ message: 'Post liked', likesCount: count[0].c });
+    res.json({ message: 'Post liked' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -33,10 +34,8 @@ exports.unlikePost = async (req, res) => {
     const postId = req.params.id;
     const userId = req.user.id;
 
-    await pool.query('DELETE FROM Likes WHERE post_id = ? AND user_id = ?', [postId, userId]);
-
-    const [count] = await pool.query('SELECT COUNT(*) as c FROM Likes WHERE post_id = ?', [postId]);
-    res.json({ message: 'Post unliked', likesCount: count[0].c });
+    await Post.findByIdAndUpdate(postId, { $pull: { likes: userId } });
+    res.json({ message: 'Post unliked' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

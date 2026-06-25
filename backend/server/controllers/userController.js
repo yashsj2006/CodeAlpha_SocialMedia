@@ -1,64 +1,90 @@
-const pool = require('../config/db');
+const { User, Post, Follow, Comment } = require('../models');
 
 exports.getUserProfile = async (req, res) => {
   try {
     const userId = req.params.id;
     const viewerId = req.user ? req.user.id : null;
 
-    const [users] = await pool.query(
-      `SELECT id, full_name as fullName, username, bio,
-              profile_picture as profilePicture, last_active as lastActive,
-              created_at as createdAt
-       FROM Users WHERE id = ?`,
-      [userId]
-    );
-    if (users.length === 0) return res.status(404).json({ message: 'User not found' });
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const user = users[0];
+    const postsCount = await Post.countDocuments({ user_id: userId, is_story: false });
+    const followersCount = await Follow.countDocuments({ following_id: userId });
+    const followingCount = await Follow.countDocuments({ follower_id: userId });
 
-    const [[{ count: postsCount }]] = await pool.query(
-      'SELECT COUNT(*) as count FROM Posts WHERE user_id = ? AND is_story = 0', [userId]
-    );
-    const [[{ count: followersCount }]] = await pool.query(
-      "SELECT COUNT(*) as count FROM Followers WHERE following_id = ? AND status = 'accepted'", [userId]
-    );
-    const [[{ count: followingCount }]] = await pool.query(
-      "SELECT COUNT(*) as count FROM Followers WHERE follower_id = ? AND status = 'accepted'", [userId]
-    );
-
-    let isFollowing = false;
-    let followStatus = null; // null | 'pending' | 'accepted'
+    let followStatus = null;
     let reverseFollowStatus = null;
-    if (viewerId && viewerId !== parseInt(userId)) {
-      const [f] = await pool.query(
-        'SELECT status FROM Followers WHERE follower_id = ? AND following_id = ?',
-        [viewerId, userId]
-      );
-      if (f.length > 0) {
-        followStatus = f[0].status;
-        isFollowing  = f[0].status === 'accepted';
+    let isBlocked = false;
+    if (viewerId && viewerId.toString() !== userId.toString()) {
+      const viewer = await User.findById(viewerId);
+      if (viewer && viewer.blocked_users && viewer.blocked_users.includes(userId)) {
+        isBlocked = true;
       }
-      const [rev] = await pool.query(
-        'SELECT status FROM Followers WHERE follower_id = ? AND following_id = ?',
-        [userId, viewerId]
-      );
-      if (rev.length > 0) {
-        reverseFollowStatus = rev[0].status;
-      }
+      const f = await Follow.findOne({ follower_id: viewerId, following_id: userId });
+      if (f) followStatus = f.status;
+      
+      const rf = await Follow.findOne({ follower_id: userId, following_id: viewerId });
+      if (rf) reverseFollowStatus = rf.status;
     }
 
-    // Get user posts
-    const [posts] = await pool.query(`
-      SELECT p.id, p.content, p.image_url as imageUrl, p.created_at as createdAt,
-             (SELECT COUNT(*) FROM Likes WHERE post_id = p.id) as likesCount,
-             (SELECT COUNT(*) FROM Comments WHERE post_id = p.id) as commentsCount
-      FROM Posts p
-      WHERE p.user_id = ? AND p.is_story = 0
-        AND (p.expires_at IS NULL OR p.expires_at > NOW())
-      ORDER BY p.created_at DESC
-    `, [userId]);
+    const posts = await Post.find({ user_id: userId, is_story: false })
+      .sort({ createdAt: -1 })
+      .lean();
+    
+    for (let p of posts) {
+      p.commentsCount = await Comment.countDocuments({ post_id: p._id });
+    }
 
-    res.json({ ...user, postsCount, followersCount, followingCount, isFollowing, followStatus, reverseFollowStatus, posts });
+    const mappedPosts = posts.map(p => ({
+      id: p._id,
+      content: p.content,
+      imageUrl: p.image_url,
+      isStory: p.is_story,
+      createdAt: p.createdAt,
+      likesCount: p.likes ? p.likes.length : 0,
+      commentsCount: p.commentsCount || 0
+    }));
+
+    const reposts = await Post.find({ shares: userId, is_story: false })
+      .populate('user_id', 'full_name username profile_picture')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    for (let r of reposts) {
+      r.commentsCount = await Comment.countDocuments({ post_id: r._id });
+    }
+
+    const mappedReposts = reposts.map(r => ({
+      id: r._id,
+      content: r.content,
+      imageUrl: r.image_url,
+      isStory: r.is_story,
+      createdAt: r.createdAt,
+      likesCount: r.likes ? r.likes.length : 0,
+      commentsCount: r.commentsCount || 0,
+      authorId: r.user_id._id,
+      authorFullName: r.user_id.full_name,
+      authorUsername: r.user_id.username,
+      authorProfilePicture: r.user_id.profile_picture
+    }));
+
+    res.json({
+      id: user._id,
+      fullName: user.full_name,
+      username: user.username,
+      profilePicture: user.profile_picture,
+      bio: user.bio,
+      lastActive: user.last_active,
+      createdAt: user.createdAt,
+      postsCount,
+      followersCount,
+      followingCount,
+      followStatus,
+      reverseFollowStatus,
+      isBlocked,
+      posts: mappedPosts,
+      reposts: mappedReposts
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -71,19 +97,26 @@ exports.updateUserProfile = async (req, res) => {
     let profilePicture = req.user.profilePicture;
 
     if (req.file) {
-      profilePicture = '/uploads/' + req.file.filename;
+      profilePicture = req.file.path; // Cloudinary URL
     }
 
-    await pool.query(
-      'UPDATE Users SET full_name = COALESCE(?, full_name), bio = COALESCE(?, bio), profile_picture = ? WHERE id = ?',
-      [fullName || null, bio !== undefined ? bio : null, profilePicture, userId]
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          full_name: fullName || undefined,
+          profile_picture: profilePicture
+        }
+      },
+      { new: true }
     );
 
-    const [updatedUsers] = await pool.query(
-      'SELECT id, full_name as fullName, username, bio, profile_picture as profilePicture FROM Users WHERE id = ?',
-      [userId]
-    );
-    res.json(updatedUsers[0]);
+    res.json({
+      id: updatedUser._id,
+      fullName: updatedUser.full_name,
+      username: updatedUser.username,
+      profilePicture: updatedUser.profile_picture
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -91,33 +124,70 @@ exports.updateUserProfile = async (req, res) => {
 
 exports.searchUsers = async (req, res) => {
   try {
-    const keyword = req.query.q ? `%${req.query.q}%` : '%';
+    const keyword = req.query.q || '';
     const currentUserId = req.user ? req.user.id : null;
 
-    const [users] = await pool.query(
-      `SELECT id, full_name as fullName, username, bio,
-              profile_picture as profilePicture, last_active as lastActive
-       FROM Users
-       WHERE (username LIKE ? OR full_name LIKE ?)
-         AND id != ?`,
-      [keyword, keyword, currentUserId || 0]
-    );
-
-    // Attach following status with pending/accepted distinction
+    const regex = new RegExp(keyword, 'i');
+    const query = {
+      $and: [
+        { $or: [{ username: regex }, { full_name: regex }] }
+      ]
+    };
     if (currentUserId) {
-      const [f] = await pool.query(
-        'SELECT following_id, status FROM Followers WHERE follower_id = ?',
-        [currentUserId]
-      );
-      const followMap = {};
-      f.forEach(r => { followMap[r.following_id] = r.status; });
+      query.$and.push({ _id: { $ne: currentUserId } });
+    }
+
+    const users = await User.find(query).lean();
+
+    if (currentUserId) {
+      const follows = await Follow.find({ follower_id: currentUserId });
+      const followingMap = {};
+      follows.forEach(f => {
+        followingMap[f.following_id.toString()] = f.status;
+      });
+      
       res.json(users.map(u => ({
-        ...u,
-        followStatus: followMap[u.id] || null
+        id: u._id,
+        fullName: u.full_name,
+        username: u.username,
+        profilePicture: u.profile_picture,
+        lastActive: u.last_active,
+        followStatus: followingMap[u._id.toString()] || null
       })));
     } else {
-      res.json(users.map(u => ({ ...u, followStatus: null })));
+      res.json(users.map(u => ({
+        id: u._id,
+        fullName: u.full_name,
+        username: u.username,
+        profilePicture: u.profile_picture,
+        lastActive: u.last_active,
+        followStatus: null
+      })));
     }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.blockUser = async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(
+      req.user.id,
+      { $addToSet: { blocked_users: req.params.id } }
+    );
+    res.json({ message: 'User blocked' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+exports.unblockUser = async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(
+      req.user.id,
+      { $pull: { blocked_users: req.params.id } }
+    );
+    res.json({ message: 'User unblocked' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
